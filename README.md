@@ -1,64 +1,243 @@
-# StockFlow - B2B Inventory Management System
+# 🧾 StockFlow - B2B Inventory Management System
+
 **Backend Case Study Submission**
 
+---
+
 ## 📌 Project Overview
-StockFlow is a B2B SaaS platform designed for small businesses to manage inventory across multiple warehouses and maintain supplier relationships. This repository contains the solution for the backend engineering case study, including code debugging, database design, and API implementation.
+
+StockFlow is a B2B SaaS platform designed for small businesses to manage inventory across multiple warehouses and maintain supplier relationships.
+
+This submission focuses on:
+
+* Debugging an existing API
+* Designing a scalable database schema
+* Implementing production-ready backend logic
 
 ---
 
-## 🛠 Part 1: Code Review & Debugging
-### Identified Issues & Impact
-1. **Lack of Atomicity (Transaction Risk):**
-   - **Issue:** The original code used two separate `db.session.commit()` calls.
-   - **Impact:** If the second commit fails, a product is created without an inventory record, leading to data corruption and "ghost products."
-2. **Missing Input Validation:**
-   - **Issue:** No check for mandatory fields like `sku` or `price`.
-   - **Impact:** The API would crash with a `500 Internal Server Error` if a key was missing in the JSON request.
-3. **Data Integrity (SKU Uniqueness):**
-   - **Issue:** SKUs must be unique across the platform, but the code didn't check for duplicates.
-   - **Impact:** Duplicate SKUs would cause operational confusion and database constraint violations.
+# 🛠 Part 1: Code Review & Debugging
 
-### The Fix
-- Implemented `@Transactional` logic (Java) to ensure both Product and Inventory are saved together or not at all.
-- Added explicit validation and error handling for `IntegrityError` (Unique SKU).
+## 🔍 Issues Identified
 
----
+### 1. Lack of Atomicity (Transaction Issue)
 
-## 🗄 Part 2: Database Design
-### Entity Relationship Summary
-The schema is designed to support multi-warehouse storage and product bundling (Composite Products).
+* The original implementation used two separate `commit()` calls.
 
-| Table | Key Columns | Purpose |
-|-------|-------------|---------|
-| **Companies** | `id, name` | High-level B2B client entity. |
-| **Warehouses** | `id, company_id, location` | Storage locations belonging to a company. |
-| **Products** | `id, sku (Unique), price, threshold` | Core product details and alert levels. |
-| **Inventory** | `product_id, warehouse_id, qty` | Tracks stock per product per warehouse. |
-| **Bundles** | `parent_id, child_id, quantity` | Mapping for "Combo" or "Kit" products. |
-| **Suppliers** | `id, name, contact_email` | Vendor information for reordering. |
+### 2. Missing Input Validation
 
-### Design Decisions
-- **Composite Primary Key:** Used `(product_id, warehouse_id)` in the Inventory table to prevent duplicate stock rows.
-- **Decimal Type:** Used `Decimal(10,2)` for prices to ensure financial accuracy.
-- **Self-Referencing Table:** The `Bundles` table allows a product to be composed of other products.
+* Direct access to request fields without validation.
 
-### Missing Requirements (Questions for Product Team)
-- Should low-stock alerts be triggered based on **Total Stock** (Company-wide) or **Local Stock** (Warehouse-specific)?
-- For **Bundles**, do we track the stock of the "Bundle SKU" itself, or is it calculated dynamically from child components?
+### 3. SKU Uniqueness Not Enforced
+
+* No check for duplicate SKUs.
+
+### 4. No Error Handling
+
+* Database failures were not handled.
+
+### 5. Unsafe Data Access
+
+* Usage of `data['field']` could crash API if key is missing.
+
+### 6. Price & Quantity Not Validated
+
+* Invalid or negative values could be stored.
+
+### 7. Rigid Warehouse Coupling
+
+* Product creation tightly coupled with a single warehouse.
 
 ---
 
-## 🚀 Part 3: API Implementation
-### Endpoint: `GET /api/companies/{id}/alerts/low-stock`
-**Assumptions & Logic:**
-- **Sales Velocity:** I assumed a helper method `calculate_days_until_stockout` exists, which uses the last 30 days of sales data to predict exhaustion.
-- **Filtering:** The API only returns products where `current_stock <= low_stock_threshold`.
-- **Joins:** Efficient SQL Joins are used to fetch Supplier and Warehouse names in a single request to avoid N+1 query problems.
+## ⚠️ Impact in Production
+
+* ❌ Partial data creation (product without inventory)
+* ❌ API crashes (500 errors due to missing fields)
+* ❌ Duplicate SKUs → operational confusion
+* ❌ Invalid financial data (negative/incorrect price)
+* ❌ Poor scalability for multi-warehouse systems
 
 ---
 
-## 🏗 Tech Stack Used
-- **Language:** Java 17
-- **Framework:** Spring Boot / Spring Data JPA
-- **Database:** PostgreSQL (Schema Design)
-- **Concepts:** ACID Transactions, RESTful API Design, Relational Modeling
+## ✅ Corrected Implementation (Flask)
+
+```python
+from flask import request, jsonify
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
+@app.route('/api/products', methods=['POST'])
+def create_product():
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({"error": "Invalid or missing JSON payload"}), 400
+
+    # Extract fields safely
+    name = data.get('name')
+    sku = data.get('sku')
+    price = data.get('price')
+    warehouse_id = data.get('warehouse_id')
+    quantity = data.get('initial_quantity', 0)
+
+    # Basic validation
+    if not name or not sku:
+        return jsonify({"error": "Both 'name' and 'sku' are required"}), 400
+
+    if price is None:
+        return jsonify({"error": "Price is required"}), 400
+
+    # Type & value validation
+    try:
+        price = float(price)
+        if price <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "Price must be a positive number"}), 400
+
+    try:
+        quantity = int(quantity)
+        if quantity < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "Initial quantity must be a non-negative integer"}), 400
+
+    try:
+        # Check SKU uniqueness
+        existing = Product.query.filter_by(sku=sku).first()
+        if existing:
+            return jsonify({"error": "SKU already exists"}), 409
+
+        # Create product
+        product = Product(
+            name=name.strip(),
+            sku=sku.strip(),
+            price=price
+        )
+
+        db.session.add(product)
+        db.session.flush()  # Get ID without committing
+
+        # Optional inventory creation
+        if warehouse_id:
+            inventory = Inventory(
+                product_id=product.id,
+                warehouse_id=warehouse_id,
+                quantity=quantity
+            )
+            db.session.add(inventory)
+
+        # Single atomic commit
+        db.session.commit()
+
+        return jsonify({
+            "message": "Product created successfully",
+            "product_id": product.id
+        }), 201
+
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Duplicate SKU or constraint violation"}), 409
+
+    except SQLAlchemyError:
+        db.session.rollback()
+        return jsonify({"error": "Database error"}), 500
+```
+
+---
+
+## 🔍 Explanation of Fixes
+
+* ✔ Used safe `.get()` instead of direct dictionary access
+* ✔ Added strong validation for required fields
+* ✔ Ensured **SKU uniqueness** at application level
+* ✔ Used **single transaction (commit)** to prevent partial data
+* ✔ Used `flush()` to generate ID before commit
+* ✔ Added proper **error handling with rollback**
+* ✔ Allowed flexible inventory creation (multi-warehouse ready)
+
+---
+
+# 🗄 Part 2: Database Design
+
+## 📊 Entity Overview
+
+| Table          | Key Columns                          | Purpose                     |
+| -------------- | ------------------------------------ | --------------------------- |
+| **Companies**  | `id, name`                           | Represents business clients |
+| **Warehouses** | `id, company_id, location`           | Stores inventory locations  |
+| **Products**   | `id, sku (Unique), price, threshold` | Product master data         |
+| **Inventory**  | `product_id, warehouse_id, qty`      | Stock per warehouse         |
+| **Bundles**    | `parent_id, child_id, quantity`      | Composite products          |
+| **Suppliers**  | `id, name, contact_email`            | Vendor management           |
+
+---
+
+## 🧠 Design Decisions
+
+* **Composite Key:** `(product_id, warehouse_id)` prevents duplicate stock entries
+* **Decimal Pricing:** Ensures financial precision
+* **Loose Coupling:** Products are independent of warehouses
+* **Bundle Support:** Enables combo/kit products
+
+---
+
+## ❓ Open Questions
+
+* Should alerts be based on:
+
+  * Total stock (global) OR
+  * Per warehouse stock?
+
+* Are bundle products:
+
+  * Stored separately OR
+  * Calculated dynamically?
+
+---
+
+# 🚀 Part 3: API Implementation
+
+## 📡 Endpoint
+
+`GET /api/companies/{id}/alerts/low-stock`
+
+## ⚙️ Logic
+
+* Filters products where:
+
+  ```
+  current_stock <= threshold
+  ```
+* Uses joins to fetch:
+
+  * Warehouse details
+  * Supplier info
+* Avoids N+1 queries
+
+## 📌 Assumptions
+
+* Sales data exists for stock prediction
+* A helper function calculates stock-out days
+
+---
+
+# 🏗 Tech Stack
+
+* **Language:** Python
+* **Framework:** Flask
+* **ORM:** SQLAlchemy
+* **Database:** PostgreSQL
+* **Concepts:** Transactions, REST APIs, Data Integrity
+
+---
+
+# 📌 Conclusion
+
+The updated implementation improves:
+
+* Data consistency
+* Error handling
+* Scalability for multi-warehouse systems
+
+This solution reflects a production-ready approach with proper validation, transactional integrity, and clean API design.
