@@ -1,80 +1,77 @@
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import java.util.*;
 
-/**
- * Service to handle Product and Inventory logic for StockFlow.
- */
+@Service
 public class InventoryService {
 
-    // --- Part 1: Code Review & Debugging (Fixed Java Version) ---
-    /*
-     * ISSUES IDENTIFIED IN ORIGINAL CODE:
-     * 1. Transactional Integrity: The original code used two separate commits. 
-     * If the second fails, we have a product with no inventory record.
-     * 2. Missing Validation: No check for null/empty SKU or negative price.
-     * 3. SKU Uniqueness: Did not handle cases where SKU already exists.
+    /**
+     * Part 1: Debugged & Corrected Product Creation
+     * Ensuring Atomicity and Validation
      */
-    
     @Transactional
     public ProductResponse createProduct(ProductRequest request) {
-        // 1. Validation (Professional approach)
-        if (request.getSku() == null || request.getSku().isEmpty()) {
-            throw new BadRequestException("SKU is mandatory");
+        // 1. Mandatory Field Validation
+        if (request.getSku() == null || request.getSku().isBlank()) {
+            throw new IllegalArgumentException("SKU is required.");
         }
 
         try {
-            // 2. Save Product
+            // 2. Create Product Entry
             Product product = new Product();
             product.setName(request.getName());
             product.setSku(request.getSku());
             product.setPrice(request.getPrice());
             productRepository.save(product);
 
-            // 3. Save Inventory in the same transaction
+            // 3. Initialize Inventory (Flushing within same transaction)
             Inventory inventory = new Inventory();
             inventory.setProductId(product.getId());
             inventory.setWarehouseId(request.getWarehouseId());
             inventory.setQuantity(request.getInitialQuantity());
             inventoryRepository.save(inventory);
 
-            return new ProductResponse("Product created successfully", product.getId());
-        } catch (DataIntegrityViolationException e) {
-            // Handle unique SKU constraint
-            throw new ConflictException("SKU already exists in the system");
+            return new ProductResponse("SUCCESS", product.getId());
+        } catch (DataIntegrityViolationException ex) {
+            // Handles Unique SKU constraint violation
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "SKU already exists.");
         }
     }
 
-    // --- Part 3: Low Stock Alerts API Implementation ---
-    /*
-     * Implementation Logic:
-     * - Filters inventory by company_id.
-     * - Joins Product and Supplier details.
-     * - Filters where current quantity <= product's threshold.
+    /**
+     * Part 3: Low-Stock Alerts Implementation
      */
     public List<LowStockAlert> getLowStockAlerts(Long companyId) {
-        List<Inventory> lowStockItems = inventoryRepository.findLowStockByCompany(companyId);
+        // Fetching data using a custom Repository Query that filters by company_id
+        // and checks quantity <= low_stock_threshold
+        List<Object[]> results = inventoryRepository.findLowStockAlertsByCompany(companyId);
+        
         List<LowStockAlert> alerts = new ArrayList<>();
-
-        for (Inventory item : lowStockItems) {
-            Product product = item.getProduct();
-            
+        for (Object[] row : results) {
             LowStockAlert alert = new LowStockAlert();
-            alert.setProductId(product.getId());
-            alert.setSku(product.getSku());
-            alert.setCurrentStock(item.getQuantity());
-            alert.setThreshold(product.getLowStockThreshold());
+            alert.setProductId((Long) row[0]);
+            alert.setProductName((String) row[1]);
+            alert.setSku((String) row[2]);
+            alert.setWarehouseId((Long) row[3]);
+            alert.setWarehouseName((String) row[4]);
+            alert.setCurrentStock((Integer) row[5]);
+            alert.setThreshold((Integer) row[6]);
             
-            // Assumption: A helper method calculates this based on recent sales data
-            alert.setDaysUntilStockout(calculateEstimatedDaysLeft(product.getId()));
+            // Business Logic Assumption: Days until stockout is calculated 
+            // by (Current Stock / Avg Daily Sales Velocity)
+            alert.setDaysUntilStockout(calculateVelocity((Long) row[0]));
+
+            // Mapping Supplier Object
+            SupplierDTO supplier = new SupplierDTO((Long) row[7], (String) row[8], (String) row[9]);
+            alert.setSupplier(supplier);
             
-            alert.setSupplier(product.getSupplier());
             alerts.add(alert);
         }
         return alerts;
     }
 
-    private int calculateEstimatedDaysLeft(Long productId) {
-        // TODO: Integrate with SalesService to get average daily velocity
-        // For now, returning a mock value as per case study requirements
-        return 10; 
+    private int calculateVelocity(Long productId) {
+        // TODO: Integrate with Sales Analytics Service
+        return 12; // Mock assumption for case study
     }
 }
