@@ -1,77 +1,154 @@
+
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
+import org.springframework.dao.DataIntegrityViolationException;
+
 import java.util.*;
 
 @Service
 public class InventoryService {
 
+    private final ProductRepository productRepository;
+    private final InventoryRepository inventoryRepository;
+
+    public InventoryService(ProductRepository productRepository,
+                            InventoryRepository inventoryRepository) {
+        this.productRepository = productRepository;
+        this.inventoryRepository = inventoryRepository;
+    }
+
     /**
      * Part 1: Debugged & Corrected Product Creation
-     * Ensuring Atomicity and Validation
+     * - Ensures atomic transaction
+     * - Adds proper validation
+     * - Handles SKU uniqueness
      */
     @Transactional
     public ProductResponse createProduct(ProductRequest request) {
-        // 1. Mandatory Field Validation
+
+        // ---- Validation ----
         if (request.getSku() == null || request.getSku().isBlank()) {
             throw new IllegalArgumentException("SKU is required.");
         }
 
+        if (request.getName() == null || request.getName().isBlank()) {
+            throw new IllegalArgumentException("Product name is required.");
+        }
+
+        if (request.getPrice() == null || request.getPrice() <= 0) {
+            throw new IllegalArgumentException("Price must be positive.");
+        }
+
         try {
-            // 2. Create Product Entry
+            // ---- Create Product ----
             Product product = new Product();
-            product.setName(request.getName());
-            product.setSku(request.getSku());
+            product.setName(request.getName().trim());
+            product.setSku(request.getSku().trim());
             product.setPrice(request.getPrice());
+
             productRepository.save(product);
 
-            // 3. Initialize Inventory (Flushing within same transaction)
-            Inventory inventory = new Inventory();
-            inventory.setProductId(product.getId());
-            inventory.setWarehouseId(request.getWarehouseId());
-            inventory.setQuantity(request.getInitialQuantity());
-            inventoryRepository.save(inventory);
+            // ---- Optional Inventory (multi-warehouse support) ----
+            if (request.getWarehouseId() != null) {
+                Inventory inventory = new Inventory();
+                inventory.setProductId(product.getId());
+                inventory.setWarehouseId(request.getWarehouseId());
+                inventory.setQuantity(
+                    request.getInitialQuantity() != null ? request.getInitialQuantity() : 0
+                );
 
-            return new ProductResponse("SUCCESS", product.getId());
+                inventoryRepository.save(inventory);
+            }
+
+            return new ProductResponse("Product created successfully", product.getId());
+
         } catch (DataIntegrityViolationException ex) {
-            // Handles Unique SKU constraint violation
-            throw new ResponseStatusException(HttpStatus.CONFLICT, "SKU already exists.");
+            // Handles duplicate SKU or DB constraint violations
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "SKU already exists or constraint violation"
+            );
         }
     }
 
     /**
      * Part 3: Low-Stock Alerts Implementation
+     * - Handles multiple warehouses
+     * - Filters by low stock threshold
+     * - Filters by recent sales
+     * - Includes supplier details
      */
-    public List<LowStockAlert> getLowStockAlerts(Long companyId) {
-        // Fetching data using a custom Repository Query that filters by company_id
-        // and checks quantity <= low_stock_threshold
-        List<Object[]> results = inventoryRepository.findLowStockAlertsByCompany(companyId);
-        
+    public LowStockResponse getLowStockAlerts(Long companyId) {
+
+        // Custom query expected to return joined data:
+        // product, warehouse, supplier info
+        List<Object[]> results =
+                inventoryRepository.findLowStockAlertsByCompany(companyId);
+
         List<LowStockAlert> alerts = new ArrayList<>();
+
         for (Object[] row : results) {
+
+            Long productId = (Long) row[0];
+
+            // ---- Rule: Only include products with recent sales ----
+            if (!hasRecentSales(productId)) {
+                continue;
+            }
+
             LowStockAlert alert = new LowStockAlert();
-            alert.setProductId((Long) row[0]);
+            alert.setProductId(productId);
             alert.setProductName((String) row[1]);
             alert.setSku((String) row[2]);
+
             alert.setWarehouseId((Long) row[3]);
             alert.setWarehouseName((String) row[4]);
+
             alert.setCurrentStock((Integer) row[5]);
             alert.setThreshold((Integer) row[6]);
-            
-            // Business Logic Assumption: Days until stockout is calculated 
-            // by (Current Stock / Avg Daily Sales Velocity)
-            alert.setDaysUntilStockout(calculateVelocity((Long) row[0]));
 
-            // Mapping Supplier Object
-            SupplierDTO supplier = new SupplierDTO((Long) row[7], (String) row[8], (String) row[9]);
+            // ---- Calculate stockout days ----
+            alert.setDaysUntilStockout(
+                    calculateDaysUntilStockout(productId, (Integer) row[5])
+            );
+
+            // ---- Supplier mapping ----
+            SupplierDTO supplier = new SupplierDTO(
+                    (Long) row[7],
+                    (String) row[8],
+                    (String) row[9]
+            );
             alert.setSupplier(supplier);
-            
+
             alerts.add(alert);
         }
-        return alerts;
+
+        return new LowStockResponse(alerts, alerts.size());
     }
 
-    private int calculateVelocity(Long productId) {
-        // TODO: Integrate with Sales Analytics Service
-        return 12; // Mock assumption for case study
+    /**
+     * Assumption:
+     * Checks if product had sales in last 30 days
+     */
+    private boolean hasRecentSales(Long productId) {
+        // TODO: integrate with SalesService / order table
+        return true;
+    }
+
+    /**
+     * Assumption:
+     * Calculates days until stockout using avg daily sales
+     */
+    private int calculateDaysUntilStockout(Long productId, int currentStock) {
+        int avgDailySales = 2; // mock value for case study
+
+        if (avgDailySales <= 0) {
+            return Integer.MAX_VALUE;
+        }
+
+        return currentStock / avgDailySales;
     }
 }
+```
